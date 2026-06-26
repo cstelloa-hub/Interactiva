@@ -1,0 +1,419 @@
+---
+title: "Análisis de Alternativos · AFP Profuturo"
+subtitle: "Investment Committee"
+format:
+  dashboard:
+    orientation: rows
+    nav-buttons: false
+    expandable: false
+    theme:
+      light: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+# ===========================================
+# CONFIGURACIÓN - ajusta estas dos líneas
+# ===========================================
+ARCHIVO <- "Prueba Macro.xlsm"   # ruta a tu archivo (mismo folder)
+MES_SEL <- "may-26"               # mes a analizar (debe coincidir con B1 de Resumen Total)
+
+# Cargar librerías
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(plotly)
+  library(reactable)
+  library(htmltools)
+  library(scales)
+})
+
+# Colores Profuturo
+COL_ROJO        <- "#D40C0C"
+COL_ROJO_CLARO  <- "#F8DCDC"
+COL_GRIS_CLARO  <- "#F5F5F5"
+COL_GRIS_MEDIO  <- "#888888"
+COL_GRIS_OSCURO <- "#333333"
+COL_BLANCO      <- "#FFFFFF"
+
+# Funciones
+fmt_pct <- function(x, d = 2) ifelse(is.na(x), "—", paste0(formatC(x*100, digits=d, format="f"), "%"))
+
+# ===========================================
+# LECTURA Y PARSEO DEL EXCEL
+# ===========================================
+
+leer_resumen <- function(archivo) {
+  raw <- suppressMessages(read_excel(archivo, sheet = "Resumen Total", col_names = FALSE))
+  raw <- as.data.frame(raw)
+  names(raw)[1:3] <- c("cat", "mtd", "ytd")
+  
+  resultado <- data.frame()
+  fondo_actual <- NA; origen_actual <- NA
+  
+  for (i in seq_len(nrow(raw))) {
+    cat_i <- as.character(raw$cat[i])
+    if (is.na(cat_i)) next
+    cat_u <- toupper(trimws(cat_i))
+    
+    if (cat_u %in% c("FONDO 2", "FONDO 3")) { fondo_actual <- cat_u; next }
+    if (cat_u == "LOCAL TOTAL")       origen_actual <- "LOCAL"
+    if (cat_u == "EXTRANJERO TOTAL")  origen_actual <- "EXTRANJERO"
+    if (grepl("TOTAL FONDO", cat_u))  origen_actual <- "TOTAL"
+    
+    mtd_val <- suppressWarnings(as.numeric(raw$mtd[i]))
+    ytd_val <- suppressWarnings(as.numeric(raw$ytd[i]))
+    
+    if (!is.na(mtd_val) || !is.na(ytd_val)) {
+      resultado <- rbind(resultado, data.frame(
+        fondo = fondo_actual, origen = origen_actual,
+        categoria = trimws(cat_i), mtd = mtd_val, ytd = ytd_val,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  resultado
+}
+
+leer_topbottom <- function(archivo) {
+  raw <- suppressMessages(read_excel(archivo, sheet = "Top Bottom", col_names = FALSE))
+  raw <- as.data.frame(raw)
+  
+  bloque_actual <- NA; vista_actual <- NA
+  out_list <- list()
+  
+  for (i in seq_len(nrow(raw))) {
+    v1 <- as.character(raw[i, 1])
+    if (is.na(v1)) next
+    v1_u <- toupper(trimws(v1))
+    
+    if (grepl("FONDO [23] - (LOCAL|EXTRANJERO)", v1_u)) { bloque_actual <- v1_u; next }
+    if (substr(v1_u, 1, 4) == "MTD ") { vista_actual <- "MTD"; next }
+    if (substr(v1_u, 1, 4) == "YTD ") { vista_actual <- "YTD"; next }
+    if (v1_u %in% c("TOP (POSITIVOS)", "FONDO", "")) next
+    if (grepl("^SUMA|^NETO", v1_u)) next
+    
+    # Top (cols 1-6)
+    fondo_t <- as.character(raw[i, 1])
+    if (!is.na(fondo_t) && fondo_t != "" && fondo_t != "Fondo") {
+      contrib_t <- suppressWarnings(as.numeric(raw[i, 5]))
+      if (!is.na(contrib_t)) {
+        out_list[[length(out_list)+1]] <- data.frame(
+          bloque = bloque_actual, vista = vista_actual, lado = "TOP",
+          fondo = fondo_t,
+          tipo = as.character(raw[i, 2]),
+          peso = suppressWarnings(as.numeric(raw[i, 3])),
+          retorno = suppressWarnings(as.numeric(raw[i, 4])),
+          contrib = contrib_t,
+          acum = suppressWarnings(as.numeric(raw[i, 6])),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+    
+    # Bottom (cols 7-12)
+    fondo_b <- as.character(raw[i, 7])
+    if (!is.na(fondo_b) && fondo_b != "" && fondo_b != "Fondo") {
+      contrib_b <- suppressWarnings(as.numeric(raw[i, 11]))
+      if (!is.na(contrib_b)) {
+        out_list[[length(out_list)+1]] <- data.frame(
+          bloque = bloque_actual, vista = vista_actual, lado = "BOTTOM",
+          fondo = fondo_b,
+          tipo = as.character(raw[i, 8]),
+          peso = suppressWarnings(as.numeric(raw[i, 9])),
+          retorno = suppressWarnings(as.numeric(raw[i, 10])),
+          contrib = contrib_b,
+          acum = suppressWarnings(as.numeric(raw[i, 12])),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  
+  if (length(out_list) == 0) return(data.frame())
+  do.call(rbind, out_list)
+}
+
+# Cargar datos
+resumen <- leer_resumen(ARCHIVO)
+topbot  <- leer_topbottom(ARCHIVO)
+
+# Helpers para tomar valores específicos
+get_total <- function(fondo, origen, metrica) {
+  v <- resumen %>%
+    filter(fondo == !!fondo,
+           (origen == !!origen | (origen == "TOTAL" & grepl("TOTAL FONDO", categoria)))) %>%
+    pull(!!sym(metrica))
+  if (length(v) == 0) return(NA)
+  v[1]
+}
+
+mtd_f2_total <- resumen %>% filter(fondo=="FONDO 2", grepl("TOTAL FONDO", categoria)) %>% pull(mtd) %>% first()
+ytd_f2_total <- resumen %>% filter(fondo=="FONDO 2", grepl("TOTAL FONDO", categoria)) %>% pull(ytd) %>% first()
+mtd_f3_total <- resumen %>% filter(fondo=="FONDO 3", grepl("TOTAL FONDO", categoria)) %>% pull(mtd) %>% first()
+ytd_f3_total <- resumen %>% filter(fondo=="FONDO 3", grepl("TOTAL FONDO", categoria)) %>% pull(ytd) %>% first()
+```
+
+# Resumen Ejecutivo
+
+## Row {height=18%}
+
+```{r}
+#| content: valuebox
+#| title: "MTD Fondo 2"
+list(
+  icon = "graph-up-arrow",
+  color = if (!is.na(mtd_f2_total) && mtd_f2_total >= 0) "#D40C0C" else "#888888",
+  value = fmt_pct(mtd_f2_total)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "YTD Fondo 2"
+list(
+  icon = "calendar3",
+  color = if (!is.na(ytd_f2_total) && ytd_f2_total >= 0) "#D40C0C" else "#888888",
+  value = fmt_pct(ytd_f2_total)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "MTD Fondo 3"
+list(
+  icon = "graph-up-arrow",
+  color = if (!is.na(mtd_f3_total) && mtd_f3_total >= 0) "#D40C0C" else "#888888",
+  value = fmt_pct(mtd_f3_total)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "YTD Fondo 3"
+list(
+  icon = "calendar3",
+  color = if (!is.na(ytd_f3_total) && ytd_f3_total >= 0) "#D40C0C" else "#888888",
+  value = fmt_pct(ytd_f3_total)
+)
+```
+
+## Row {height=82%}
+
+### Column {width=50%}
+
+```{r}
+#| title: "Fondo 2 · Desglose por Origen y Categoría"
+df <- resumen %>%
+  filter(fondo == "FONDO 2", !grepl("TOTAL FONDO", categoria)) %>%
+  mutate(
+    Origen = case_when(
+      origen == "LOCAL" ~ "Local",
+      origen == "EXTRANJERO" ~ "Extranjero",
+      TRUE ~ origen
+    ),
+    Categoría = categoria,
+    MTD = mtd, YTD = ytd
+  ) %>%
+  select(Origen, Categoría, MTD, YTD)
+
+reactable(
+  df,
+  columns = list(
+    Origen = colDef(name = "Origen", width = 110, style = function(value) {
+      if (grepl("TOTAL", toupper(value))) list(fontWeight = "bold", background = COL_GRIS_CLARO)
+      else list()
+    }),
+    Categoría = colDef(name = "Categoría", style = function(value) {
+      if (grepl("TOTAL", toupper(value))) list(fontWeight = "bold", background = COL_GRIS_CLARO)
+      else list()
+    }),
+    MTD = colDef(format = colFormat(percent = TRUE, digits = 2),
+                 style = function(value) {
+                   if (is.na(value)) return(list())
+                   list(color = if (value < 0) "#B00020" else COL_GRIS_OSCURO,
+                        fontWeight = "500")
+                 }),
+    YTD = colDef(format = colFormat(percent = TRUE, digits = 2),
+                 style = function(value) {
+                   if (is.na(value)) return(list())
+                   list(color = if (value < 0) "#B00020" else COL_GRIS_OSCURO,
+                        fontWeight = "500")
+                 })
+  ),
+  pagination = FALSE,
+  striped = TRUE,
+  highlight = TRUE,
+  theme = reactableTheme(
+    borderColor = "#DDD",
+    stripedColor = COL_GRIS_CLARO,
+    highlightColor = COL_ROJO_CLARO,
+    headerStyle = list(background = COL_ROJO, color = "white", fontWeight = "bold")
+  )
+)
+```
+
+### Column {width=50%}
+
+```{r}
+#| title: "Fondo 3 · Desglose por Origen y Categoría"
+df3 <- resumen %>%
+  filter(fondo == "FONDO 3", !grepl("TOTAL FONDO", categoria)) %>%
+  mutate(Origen = case_when(
+    origen == "LOCAL" ~ "Local",
+    origen == "EXTRANJERO" ~ "Extranjero",
+    TRUE ~ origen
+  ), Categoría = categoria, MTD = mtd, YTD = ytd) %>%
+  select(Origen, Categoría, MTD, YTD)
+
+reactable(
+  df3,
+  columns = list(
+    Origen = colDef(name = "Origen", width = 110),
+    MTD = colDef(format = colFormat(percent = TRUE, digits = 2)),
+    YTD = colDef(format = colFormat(percent = TRUE, digits = 2))
+  ),
+  pagination = FALSE, striped = TRUE, highlight = TRUE,
+  theme = reactableTheme(
+    borderColor = "#DDD",
+    stripedColor = COL_GRIS_CLARO,
+    highlightColor = COL_ROJO_CLARO,
+    headerStyle = list(background = COL_ROJO, color = "white", fontWeight = "bold")
+  )
+)
+```
+
+# Contribuidores 80% (Pareto)
+
+## Row {.tabset}
+
+```{r}
+#| title: "F2 Local · MTD"
+df <- topbot %>% filter(bloque == "FONDO 2 - LOCAL", vista == "MTD")
+
+plot_pareto <- function(df, titulo) {
+  if (nrow(df) == 0) return(plotly_empty())
+  
+  top <- df %>% filter(lado == "TOP") %>% arrange(desc(contrib))
+  bot <- df %>% filter(lado == "BOTTOM") %>% arrange(contrib)
+  
+  fig <- plot_ly()
+  
+  if (nrow(top) > 0) {
+    fig <- fig %>% add_bars(
+      x = top$fondo, y = top$contrib, name = "Top (positivos)",
+      marker = list(color = COL_ROJO),
+      hovertemplate = paste0("<b>%{x}</b><br>Contrib: %{y:.4%}<br>Peso: %{customdata[0]:.2%}<br>Retorno: %{customdata[1]:.2%}<extra></extra>"),
+      customdata = cbind(top$peso, top$retorno)
+    )
+  }
+  if (nrow(bot) > 0) {
+    fig <- fig %>% add_bars(
+      x = bot$fondo, y = bot$contrib, name = "Bottom (negativos)",
+      marker = list(color = COL_GRIS_MEDIO),
+      hovertemplate = paste0("<b>%{x}</b><br>Contrib: %{y:.4%}<br>Peso: %{customdata[0]:.2%}<br>Retorno: %{customdata[1]:.2%}<extra></extra>"),
+      customdata = cbind(bot$peso, bot$retorno)
+    )
+  }
+  
+  fig %>%
+    layout(
+      title = list(text = titulo, font = list(size = 14, color = COL_GRIS_OSCURO)),
+      yaxis = list(title = "Contribución", tickformat = ".3%", zeroline = TRUE, zerolinecolor = COL_GRIS_OSCURO),
+      xaxis = list(title = "", tickangle = -30, tickfont = list(size = 9)),
+      legend = list(orientation = "h", y = -0.3),
+      margin = list(b = 120, t = 50),
+      hoverlabel = list(bgcolor = "white", font = list(color = COL_GRIS_OSCURO)),
+      plot_bgcolor = "white", paper_bgcolor = "white"
+    ) %>%
+    config(displayModeBar = FALSE)
+}
+
+plot_pareto(df, "MTD")
+```
+
+```{r}
+#| title: "F2 Local · YTD"
+df <- topbot %>% filter(bloque == "FONDO 2 - LOCAL", vista == "YTD")
+plot_pareto(df, "YTD")
+```
+
+```{r}
+#| title: "F2 Extranjero · MTD"
+df <- topbot %>% filter(bloque == "FONDO 2 - EXTRANJERO", vista == "MTD")
+plot_pareto(df, "MTD")
+```
+
+```{r}
+#| title: "F2 Extranjero · YTD"
+df <- topbot %>% filter(bloque == "FONDO 2 - EXTRANJERO", vista == "YTD")
+plot_pareto(df, "YTD")
+```
+
+```{r}
+#| title: "F3 Local · MTD"
+df <- topbot %>% filter(bloque == "FONDO 3 - LOCAL", vista == "MTD")
+plot_pareto(df, "MTD")
+```
+
+```{r}
+#| title: "F3 Local · YTD"
+df <- topbot %>% filter(bloque == "FONDO 3 - LOCAL", vista == "YTD")
+plot_pareto(df, "YTD")
+```
+
+```{r}
+#| title: "F3 Extranjero · MTD"
+df <- topbot %>% filter(bloque == "FONDO 3 - EXTRANJERO", vista == "MTD")
+plot_pareto(df, "MTD")
+```
+
+```{r}
+#| title: "F3 Extranjero · YTD"
+df <- topbot %>% filter(bloque == "FONDO 3 - EXTRANJERO", vista == "YTD")
+plot_pareto(df, "YTD")
+```
+
+## Row
+
+```{r}
+#| title: "Detalle de Contribuidores (filtrable)"
+if (nrow(topbot) > 0) {
+  reactable(
+    topbot %>%
+      mutate(
+        Bloque = bloque, Vista = vista, Lado = lado,
+        Fondo = fondo, Tipo = tipo,
+        Peso = peso, Retorno = retorno, Contribución = contrib, `% Acum` = acum
+      ) %>%
+      select(Bloque, Vista, Lado, Fondo, Tipo, Peso, Retorno, Contribución, `% Acum`),
+    filterable = TRUE,
+    searchable = TRUE,
+    defaultPageSize = 15,
+    columns = list(
+      Peso = colDef(format = colFormat(percent = TRUE, digits = 2)),
+      Retorno = colDef(format = colFormat(percent = TRUE, digits = 2)),
+      Contribución = colDef(format = colFormat(percent = TRUE, digits = 4),
+                            style = function(v) {
+                              if (is.na(v)) return(list())
+                              list(color = if (v < 0) "#B00020" else COL_GRIS_OSCURO,
+                                   fontWeight = "500")
+                            }),
+      `% Acum` = colDef(format = colFormat(percent = TRUE, digits = 1))
+    ),
+    striped = TRUE, highlight = TRUE,
+    theme = reactableTheme(
+      borderColor = "#DDD",
+      stripedColor = COL_GRIS_CLARO,
+      highlightColor = COL_ROJO_CLARO,
+      headerStyle = list(background = COL_ROJO, color = "white", fontWeight = "bold")
+    )
+  )
+} else {
+  htmltools::tags$p("No hay datos de contribuidores disponibles.")
+}
+```
